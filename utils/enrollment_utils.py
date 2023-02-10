@@ -277,4 +277,100 @@ def create_provisional_xml(request_security_token: dict[str, Any]) -> str:
     3. Encoding provisional xml in base64 bytes
     """
 
-    raise NotImplementedError()
+    root_ca_cert: crypto.X509 = crypto.load_certificate(
+        crypto.FILETYPE_PEM, _ROOT_CA_CERT
+    )
+    root_ca_key: crypto.PKey = crypto.load_privatekey(
+        crypto.FILETYPE_PEM, _ROOT_CA_KEY
+    )
+
+    request_subject: crypto.X509Name
+    request_public_key: crypto.PKey
+    request_subject, request_public_key = _get_request_subject_and_public_key(
+        request_security_token["wsse:BinarySecurityToken"]["#text"]
+    )
+    identity_certificate: crypto.X509 = _create_identity_certificate(
+        request_subject, request_public_key, root_ca_cert.get_subject(), root_ca_key
+    )
+
+    provisional_xml: str = _PROVISIONAL_XML.format(
+        root_ca_cert.digest("sha1").decode("utf8").replace(":", ""),
+        _convert_bytes_to_string(root_ca_cert),
+        identity_certificate.digest("sha1").decode("utf8").replace(":", ""),
+        _convert_bytes_to_string(identity_certificate),
+        _MANAGEMENT_SERVER_URl,
+        _SSL_CRITERIA.format(urllib.parse.quote(_CERT_COMMON_NAME)),
+    )
+
+    return base64.encodebytes(provisional_xml.encode()).decode("utf-8")
+
+
+def _format_certificate_string(certificate_string: str) -> str:
+    """1.Format certificate string to 64 bit
+      certificate string.
+    2.Adding begin and end certificate request line
+    """
+
+    new_certificate: str = "-----BEGIN CERTIFICATE REQUEST-----\n"
+    new_certificate += re.sub("(.{64})", "\\1\n", certificate_string, 0, re.DOTALL)
+    new_certificate = new_certificate + "\n-----END CERTIFICATE REQUEST-----"
+    return new_certificate
+
+
+def _get_request_subject_and_public_key(
+    request_certificate_string: str,
+) -> tuple[crypto.X509Name, crypto.PKey]:
+    """Returns a tuple containing subject and public key
+    of request security certificate from windows request body
+    """
+
+    request_certificate: crypto.X509 = crypto.load_certificate_request(
+        crypto.FILETYPE_PEM, _format_certificate_string(request_certificate_string)
+    )
+    request_certificate.get_subject().CN = _CERT_COMMON_NAME
+    return request_certificate.get_subject(), request_certificate.get_pubkey()
+
+
+def _create_identity_certificate(
+    request_subject: crypto.X509Name,
+    request_public_key: crypto.PKey,
+    ca_cert_subject: crypto.X509Name,
+    root_ca_key: crypto.PKey,
+) -> crypto.X509:
+    """Creates an identioty certificate with root_ca subject name
+    along with request subject name and public key using crypto module
+    """
+
+    certificate_created_time: int = int(datetime.datetime.utcnow().timestamp())
+    certificate_expiry_time: int = int(
+        (
+            datetime.datetime.utcnow()
+            + datetime.timedelta(days=_CERTIFICATE_VALIDITY_PERIOD)
+        ).timestamp()
+    )
+    identity_certificate: crypto.X509 = crypto.X509()
+    identity_certificate.gmtime_adj_notBefore(certificate_created_time)
+    identity_certificate.gmtime_adj_notAfter(certificate_expiry_time)
+    identity_certificate.set_issuer(ca_cert_subject)
+    identity_certificate.set_subject(request_subject)
+    identity_certificate.set_pubkey(request_public_key)
+    identity_certificate.add_extensions(
+        [
+            crypto.X509Extension(b"extendedKeyUsage", True, b"clientAuth"),
+            crypto.X509Extension(b"keyUsage", True, b"digitalSignature"),
+            crypto.X509Extension(b"basicConstraints", True, b"CA:FALSE"),
+            crypto.X509Extension(
+                b"subjectKeyIdentifier", False, b"hash", subject=identity_certificate
+            ),
+        ]
+    )
+    identity_certificate.sign(root_ca_key, "sha1")
+    identity_certificate.get_subject().CN = _CERT_COMMON_NAME
+    return identity_certificate
+
+
+def _convert_bytes_to_string(certificate: crypto.X509) -> str:
+    """Converts crypto X509 certificate to string format"""
+
+    cert: bytes = crypto.dump_certificate(crypto.FILETYPE_PEM, certificate)
+    return cert[28:-26].decode("utf8")
